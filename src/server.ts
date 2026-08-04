@@ -73,22 +73,28 @@ function requireKnownModel(model: unknown): string | Response {
   return model;
 }
 
-function sseChunkStream(chunks: unknown[]): ReadableStream<Uint8Array> {
+interface SseEvent {
+  event?: string;
+  data: unknown;
+}
+
+function sseChunkStream(events: SseEvent[], terminator: string | null): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   return new ReadableStream({
     async start(controller) {
-      for (const chunk of chunks) {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      for (const evt of events) {
+        const eventLine = evt.event ? `event: ${evt.event}\n` : "";
+        controller.enqueue(encoder.encode(`${eventLine}data: ${JSON.stringify(evt.data)}\n\n`));
         await new Promise((resolve) => setTimeout(resolve, 15));
       }
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      if (terminator !== null) controller.enqueue(encoder.encode(`data: ${terminator}\n\n`));
       controller.close();
     },
   });
 }
 
-function sseResponse(chunks: unknown[]): Response {
-  return new Response(sseChunkStream(chunks), {
+function sseResponse(events: SseEvent[], terminator: string | null = "[DONE]"): Response {
+  return new Response(sseChunkStream(events, terminator), {
     headers: {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
@@ -144,7 +150,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       model: modelCheck,
       choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
     };
-    return sseResponse([roleChunk, ...contentChunks, finalChunk]);
+    return sseResponse([roleChunk, ...contentChunks, finalChunk].map((data) => ({ data })));
   }
 
   return jsonResponse({
@@ -206,7 +212,7 @@ async function handleCompletions(req: Request): Promise<Response> {
       model: modelCheck,
       choices: [{ text: "", index: 0, logprobs: null, finish_reason: "stop" }],
     };
-    return sseResponse([...contentChunks, finalChunk]);
+    return sseResponse([...contentChunks, finalChunk].map((data) => ({ data })));
   }
 
   return jsonResponse({
@@ -221,6 +227,99 @@ async function handleCompletions(req: Request): Promise<Response> {
       total_tokens: promptTokens + completionTokens,
     },
   });
+}
+
+// OpenAI's newer Responses API (POST /v1/responses) — added alongside the
+// existing Chat Completions / Completions / Embeddings support above,
+// none of which is removed.
+interface ResponsesRequest {
+  model: string;
+  input: string | ChatMessage[];
+  instructions?: string;
+  stream?: boolean;
+}
+
+async function handleResponses(req: Request): Promise<Response> {
+  let body: ResponsesRequest;
+  try {
+    body = (await req.json()) as ResponsesRequest;
+  } catch {
+    return errorResponse("invalid JSON body", 400);
+  }
+  const modelCheck = requireKnownModel(body.model);
+  if (modelCheck instanceof Response) return modelCheck;
+  if (typeof body.input !== "string" && !Array.isArray(body.input)) {
+    return errorResponse("'input' is required and must be a string or an array of input items", 400);
+  }
+  const inputText = typeof body.input === "string" ? body.input : lastUserMessageText(body.input);
+
+  const replyText = await promptForCompletion({
+    model: modelCheck,
+    endpoint: "responses",
+    lastUserMessage: inputText,
+  });
+
+  const id = `resp_${crypto.randomUUID()}`;
+  const messageId = `msg_${crypto.randomUUID()}`;
+  const createdAt = Math.floor(Date.now() / 1000);
+  const inputTokens = estimateTokens(inputText) + estimateTokens(body.instructions ?? "");
+  const outputTokens = estimateTokens(replyText);
+
+  const outputItem = {
+    id: messageId,
+    type: "message",
+    status: "completed",
+    role: "assistant",
+    content: [{ type: "output_text", text: replyText, annotations: [] }],
+  };
+
+  const responseObject = {
+    id,
+    object: "response",
+    created_at: createdAt,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    instructions: body.instructions ?? null,
+    model: modelCheck,
+    output: [outputItem],
+    output_text: replyText,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+    },
+  };
+
+  if (body.stream) {
+    const words = replyText.length === 0 ? [] : replyText.split(/(?<=\s)/);
+    const deltaEvents: SseEvent[] = words.map((word) => ({
+      event: "response.output_text.delta",
+      data: { type: "response.output_text.delta", item_id: messageId, output_index: 0, content_index: 0, delta: word },
+    }));
+    const events: SseEvent[] = [
+      {
+        event: "response.created",
+        data: { type: "response.created", response: { ...responseObject, status: "in_progress", output: [], output_text: "" } },
+      },
+      {
+        event: "response.output_item.added",
+        data: { type: "response.output_item.added", output_index: 0, item: { ...outputItem, status: "in_progress", content: [] } },
+      },
+      ...deltaEvents,
+      {
+        event: "response.output_text.done",
+        data: { type: "response.output_text.done", item_id: messageId, output_index: 0, content_index: 0, text: replyText },
+      },
+      { event: "response.output_item.done", data: { type: "response.output_item.done", output_index: 0, item: outputItem } },
+      { event: "response.completed", data: { type: "response.completed", response: responseObject } },
+    ];
+    // Responses API streams don't end with a "[DONE]" sentinel — the
+    // response.completed event followed by stream close is the signal.
+    return sseResponse(events, null);
+  }
+
+  return jsonResponse(responseObject);
 }
 
 interface EmbeddingsRequest {
@@ -291,6 +390,7 @@ const server = Bun.serve({
     if (req.method === "POST" && path === "/v1/chat/completions") return handleChatCompletions(req);
     if (req.method === "POST" && path === "/v1/completions") return handleCompletions(req);
     if (req.method === "POST" && path === "/v1/embeddings") return handleEmbeddings(req);
+    if (req.method === "POST" && path === "/v1/responses") return handleResponses(req);
     if (req.method === "GET" && path === "/") {
       return jsonResponse({ status: "ok", message: "openai-madeup-endpoint is running" });
     }
