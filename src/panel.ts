@@ -188,6 +188,11 @@ export const PANEL_HTML = String.raw`<!doctype html>
   .kv-row select { flex: 0 0 90px; }
   .error-line { color: #ff9aa2; font-size: 12px; margin-top: 6px; }
   .field-desc { color: #6b7280; font-size: 11px; margin-top: -2px; margin-bottom: 4px; }
+  .field-block { margin-bottom: 10px; }
+  .nested-box { border: 1px dashed #333846; border-radius: 6px; padding: 10px 12px; margin-top: 4px; background: #14161c; }
+  .array-field { margin-top: 4px; }
+  .array-item { display: flex; gap: 8px; align-items: flex-start; border-left: 2px solid #333846; padding: 8px 0 8px 10px; margin-bottom: 8px; }
+  .array-item > *:first-child { flex: 1; }
 </style>
 </head>
 <body>
@@ -240,36 +245,46 @@ function renderSidebar() {
   }
 }
 
-function fieldInput(schema) {
+// Builds one input for a single JSON-schema value. Recurses into nested
+// "object" (known properties) and "array" (known item schema) shapes so
+// nested JSON never has to be hand-typed — only a schema-less object/array
+// leaf falls back to free-form key/value rows (never to a raw JSON blob).
+// read() returns { value } | { skip: true } (blank + optional) | { error }.
+function buildValueField(schema) {
   if (schema.enum) {
-    const select = el("select", {});
+    const select = el("select", {}, [el("option", { value: "", text: "(choose)" })]);
     for (const opt of schema.enum) select.appendChild(el("option", { value: String(opt), text: String(opt) }));
-    return { node: select, read: () => coerce(select.value, schema.type) };
+    return { node: select, read: () => (select.value === "" ? { skip: true } : coerce(select.value, schema.type)) };
   }
   if (schema.type === "boolean") {
-    const select = el("select", {}, [el("option", { value: "true", text: "true" }), el("option", { value: "false", text: "false" })]);
-    return { node: select, read: () => ({ value: select.value === "true" }) };
+    const select = el("select", {}, [
+      el("option", { value: "", text: "(unset)" }),
+      el("option", { value: "true", text: "true" }),
+      el("option", { value: "false", text: "false" }),
+    ]);
+    return { node: select, read: () => (select.value === "" ? { skip: true } : { value: select.value === "true" }) };
   }
   if (schema.type === "number" || schema.type === "integer") {
     const input = el("input", { type: "number", ...(schema.type === "integer" ? { step: "1" } : { step: "any" }) });
-    return { node: input, read: () => coerce(input.value, schema.type) };
+    return { node: input, read: () => (input.value === "" ? { skip: true } : coerce(input.value, schema.type)) };
   }
-  if (schema.type === "array" || schema.type === "object") {
-    const textarea = el("textarea", { placeholder: schema.type === "array" ? "[]" : "{}" });
-    return {
-      node: textarea,
-      read: () => {
-        const raw = textarea.value.trim() || (schema.type === "array" ? "[]" : "{}");
-        try { return { value: JSON.parse(raw) }; } catch { return { error: "must be valid JSON " + (schema.type === "array" ? "array" : "object") }; }
-      },
-    };
+  if (schema.type === "object") {
+    if (schema.properties) {
+      const built = buildObjectFields(schema.properties, schema.required);
+      return { node: el("div", { class: "nested-box" }, [built.node]), read: built.collect };
+    }
+    const built = buildFreeformFields();
+    const box = el("div", { class: "nested-box" }, [el("div", { class: "field-desc", text: "free-form object (no schema)" }), built.node]);
+    return { node: box, read: built.collect };
+  }
+  if (schema.type === "array") {
+    return buildArrayField(schema.items ?? { type: "string" });
   }
   const input = el("input", { type: "text" });
-  return { node: input, read: () => ({ value: input.value }) };
+  return { node: input, read: () => (input.value === "" ? { skip: true } : { value: input.value }) };
 }
 
 function coerce(text, type) {
-  if (text === "") return { error: "required" };
   if (type === "integer") {
     const n = Number(text);
     return Number.isInteger(n) ? { value: n } : { error: "must be an integer" };
@@ -281,30 +296,34 @@ function coerce(text, type) {
   return { value: text };
 }
 
-// A call card for a tool WITH a JSON-schema properties object: one
-// labeled input per property, typed by its schema. Returns a collect()
-// callback that yields {value: object} or {error} without hand-typed JSON.
-function buildSchemaCall(tool) {
-  const props = Object.entries(tool.parameters?.properties ?? {});
-  const required = new Set(tool.parameters?.required ?? []);
-  const card = el("div", { class: "call-card" });
-  const fields = props.map(([key, schema]) => {
+// Renders one labeled field per property of a JSON-schema object — the core
+// "no formatting done by me" building block, reused for the top-level call
+// arguments AND for every nested object property found inside them.
+function buildObjectFields(properties, requiredKeys) {
+  const required = new Set(requiredKeys ?? []);
+  const container = el("div", { class: "object-fields" });
+  const fields = Object.entries(properties ?? {}).map(([key, schema]) => {
     const isRequired = required.has(key);
     const type = schema.type ? "<" + schema.type + ">" : "";
-    card.appendChild(el("label", { class: "field-label", text: key + type + (isRequired ? " (required)" : " (optional)") }));
-    if (schema.description) card.appendChild(el("div", { class: "field-desc", text: schema.description }));
-    const { node, read } = fieldInput(schema);
-    card.appendChild(node);
+    const block = el("div", { class: "field-block" });
+    block.appendChild(el("label", { class: "field-label", text: key + type + (isRequired ? " (required)" : " (optional)") }));
+    if (schema.description) block.appendChild(el("div", { class: "field-desc", text: schema.description }));
+    const { node, read } = buildValueField(schema);
+    block.appendChild(node);
+    container.appendChild(block);
     return { key, isRequired, read };
   });
   return {
-    node: card,
+    node: container,
     collect() {
       const out = {};
       for (const f of fields) {
         const res = f.read();
         if (res.error) return { error: f.key + ": " + res.error };
-        if (res.value === "" && !f.isRequired) continue;
+        if (res.skip) {
+          if (f.isRequired) return { error: f.key + ": required" };
+          continue;
+        }
         out[f.key] = res.value;
       }
       return { value: out };
@@ -312,14 +331,49 @@ function buildSchemaCall(tool) {
   };
 }
 
-// A call card for a tool with NO schema (or an empty schema): a free-form
-// list of key/value rows with a per-row type selector, so the operator
-// never hand-writes a JSON object either.
-function buildFreeformCall() {
-  const card = el("div", { class: "call-card" });
+// A repeatable list of one field per array item, typed by itemSchema -
+// including nested objects, so "array of objects" never needs raw JSON
+// either. Arrays always yield a value (possibly []), never "skip".
+function buildArrayField(itemSchema) {
+  const container = el("div", { class: "array-field" });
   const rows = el("div", {});
-  card.appendChild(el("label", { class: "field-label", text: "arguments (no schema provided)" }));
-  card.appendChild(rows);
+  container.appendChild(rows);
+  const items = [];
+  function addItem() {
+    const built = buildValueField(itemSchema);
+    const row = el("div", { class: "array-item" });
+    row.appendChild(built.node);
+    row.appendChild(el("button", {
+      class: "small danger",
+      text: "✕ remove item",
+      onclick: () => { row.remove(); items.splice(items.indexOf(entry), 1); },
+    }));
+    const entry = { read: built.read };
+    items.push(entry);
+    rows.appendChild(row);
+  }
+  container.appendChild(el("button", { class: "small", text: "+ add item", onclick: addItem }));
+  return {
+    node: container,
+    read() {
+      const out = [];
+      for (const it of items) {
+        const res = it.read();
+        if (res.error) return { error: res.error };
+        if (!res.skip) out.push(res.value);
+      }
+      return { value: out };
+    },
+  };
+}
+
+// A free-form list of key/value rows with a per-row type selector, used
+// both as the whole-call fallback (tool has no schema at all) and as the
+// fallback for a nested object property that itself has no known shape.
+function buildFreeformFields() {
+  const wrap = el("div", {});
+  const rows = el("div", {});
+  wrap.appendChild(rows);
   const rowState = [];
   function addRow() {
     const key = el("input", { type: "text", placeholder: "key" });
@@ -336,10 +390,10 @@ function buildFreeformCall() {
     rowState.push(entry);
     rows.appendChild(row);
   }
-  card.appendChild(el("button", { class: "small", text: "+ add field", onclick: addRow }));
+  wrap.appendChild(el("button", { class: "small", text: "+ add field", onclick: addRow }));
   addRow();
   return {
-    node: card,
+    node: wrap,
     collect() {
       const out = {};
       for (const { key, value, type } of rowState) {
@@ -360,6 +414,23 @@ function buildFreeformCall() {
       return { value: out };
     },
   };
+}
+
+// A call card for a tool WITH a JSON-schema properties object.
+function buildSchemaCall(tool) {
+  const card = el("div", { class: "call-card" });
+  const built = buildObjectFields(tool.parameters?.properties ?? {}, tool.parameters?.required);
+  card.appendChild(built.node);
+  return { node: card, collect: built.collect };
+}
+
+// A call card for a tool with NO schema (or an empty schema).
+function buildFreeformCall() {
+  const card = el("div", { class: "call-card" });
+  card.appendChild(el("label", { class: "field-label", text: "arguments (no schema provided)" }));
+  const built = buildFreeformFields();
+  card.appendChild(built.node);
+  return { node: card, collect: built.collect };
 }
 
 function renderMain() {
