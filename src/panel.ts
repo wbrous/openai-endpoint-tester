@@ -271,16 +271,20 @@ function buildValueField(schema) {
     return { node: input, read: () => (input.value === "" ? { skip: true } : coerce(input.value, schema.type)) };
   }
   if (schema.type === "object") {
-    if (schema.properties) {
+    if (schema.properties && Object.keys(schema.properties).length > 0) {
       const built = buildObjectFields(schema.properties, schema.required);
       return { node: el("div", { class: "nested-box" }, [built.node]), read: built.collect };
     }
     const built = buildFreeformFields();
-    const box = el("div", { class: "nested-box" }, [el("div", { class: "field-desc", text: "free-form object (no schema)" }), built.node]);
+    const box = el("div", { class: "nested-box" }, [el("div", { class: "field-desc", text: "free-form object (no fixed keys — add any key/value pairs)" }), built.node]);
     return { node: box, read: built.collect };
   }
   if (schema.type === "array") {
     return buildArrayField(schema.items ?? { type: "string" });
+  }
+  if (schema.type === "string") {
+    const input = el("input", { type: "text" });
+    return { node: input, read: () => (input.value === "" ? { skip: true } : { value: input.value }) };
   }
   return buildStringOrJsonField();
 }
