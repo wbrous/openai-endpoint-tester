@@ -188,6 +188,8 @@ export const PANEL_HTML = String.raw`<!doctype html>
   .kv-row select { flex: 0 0 90px; }
   .error-line { color: #ff9aa2; font-size: 12px; margin-top: 6px; }
   .field-desc { color: #6b7280; font-size: 11px; margin-top: -2px; margin-bottom: 4px; }
+  .json-toggle { display: flex; align-items: center; gap: 6px; color: #8b93a7; font-size: 11px; margin-bottom: 4px; cursor: pointer; }
+  .json-toggle input { width: auto; }
   .field-block { margin-bottom: 10px; }
   .nested-box { border: 1px dashed #333846; border-radius: 6px; padding: 10px 12px; margin-top: 4px; background: #14161c; }
   .array-field { margin-top: 4px; }
@@ -280,8 +282,47 @@ function buildValueField(schema) {
   if (schema.type === "array") {
     return buildArrayField(schema.items ?? { type: "string" });
   }
-  const input = el("input", { type: "text" });
-  return { node: input, read: () => (input.value === "" ? { skip: true } : { value: input.value }) };
+  return buildStringOrJsonField();
+}
+
+// Fallback for a field with no declared/recognized type (common for loosely
+// specified tools that only explain the shape in a description). Defaults
+// to a plain string box; a "raw JSON" checkbox swaps it for a textarea so
+// an operator who actually needs a nested object/array can type valid
+// JSON explicitly, instead of the field silently mangling {a: 1} into the
+// literal string "{a: 1}".
+function buildStringOrJsonField() {
+  let asJson = false;
+  const stringInput = el("input", { type: "text", placeholder: "value" });
+  const jsonArea = el("textarea", { placeholder: 'raw JSON — e.g. {"data":"..."} or ["a","b"] or 42 or true' });
+  const body = el("div", {}, [stringInput]);
+  const checkbox = el("input", {
+    type: "checkbox",
+    onchange: () => {
+      asJson = checkbox.checked;
+      body.innerHTML = "";
+      body.appendChild(asJson ? jsonArea : stringInput);
+    },
+  });
+  const toggle = el("label", { class: "json-toggle" }, [
+    checkbox,
+    document.createTextNode(" raw JSON (this field has no declared type — check this to send an object/array/number/bool instead of text)"),
+  ]);
+  return {
+    node: el("div", {}, [toggle, body]),
+    read: () => {
+      if (asJson) {
+        const raw = jsonArea.value.trim();
+        if (raw === "") return { skip: true };
+        try {
+          return { value: JSON.parse(raw) };
+        } catch {
+          return { error: "not valid JSON" };
+        }
+      }
+      return stringInput.value === "" ? { skip: true } : { value: stringInput.value };
+    },
+  };
 }
 
 function coerce(text, type) {
