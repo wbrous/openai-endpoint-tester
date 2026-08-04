@@ -1,49 +1,6 @@
-// Renders vision-input images inline in the operator's terminal via Kitty's
-// graphics protocol (`kitty +kitten icat`), so the human standing in for the
-// model actually sees what the client attached.
-import { spawn } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
-async function fetchImageBytes(url: string): Promise<Uint8Array> {
-  if (url.startsWith("data:")) {
-    const comma = url.indexOf(",");
-    if (comma === -1) throw new Error("malformed data URI");
-    const meta = url.slice(5, comma);
-    const b64 = url.slice(comma + 1);
-    return meta.includes("base64") ? Uint8Array.from(Buffer.from(b64, "base64")) : new TextEncoder().encode(decodeURIComponent(b64));
-  }
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch failed: HTTP ${res.status}`);
-  return new Uint8Array(await res.arrayBuffer());
-}
-
-/**
- * Precondition: none — safe to call even without a Kitty-capable terminal or
- * network access.
- * Postcondition: on success, the image is written to Kitty's graphics
- * protocol on process.stdout; on any failure (bad URL, non-Kitty terminal,
- * missing `kitty` binary), a one-line fallback note is printed instead and
- * the promise still resolves.
- */
-export async function renderImageInline(url: string): Promise<void> {
-  try {
-    const bytes = await fetchImageBytes(url);
-    const dir = await mkdtemp(join(tmpdir(), "madeup-img-"));
-    const file = join(dir, "image");
-    await writeFile(file, bytes);
-    await new Promise<void>((resolve) => {
-      const proc = spawn("kitty", ["+kitten", "icat", "--align", "left", file], {
-        stdio: ["ignore", "inherit", "inherit"],
-      });
-      proc.on("exit", () => resolve());
-      proc.on("error", () => resolve());
-    });
-  } catch (err) {
-    console.log(`[image could not be displayed: ${(err as Error).message}] ${url.slice(0, 80)}`);
-  }
-}
+// Extracts vision-input image references from request content so the panel
+// can render them with a plain `<img>` tag — the browser does the fetching
+// and decoding, no server-side terminal graphics protocol needed.
 
 interface ContentPart {
   type?: string;
